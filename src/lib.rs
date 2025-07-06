@@ -78,13 +78,23 @@ impl Struct {
 
 #[proc_macro_attribute]
 pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // let mut new_structs = Structs::new();
     let mut structs = HashMap::<String, Struct>::new();
 
-    // Parse the input item
+    // Parse the input item (the struct this attribute is attached to)
     let mut main = parse_macro_input!(item as DeriveInput);
     
-    // Get the struct fields
+    // --- START of MODIFICATIONS ---
+
+    // NEW: Find and clone all #[derive(...)] attributes from the original struct.
+    let forwarded_derives: Vec<Attribute> = main
+        .attrs
+        .iter()
+        .filter(|attr| attr.path.is_ident("derive"))
+        .cloned()
+        .collect();
+
+    // --- END of MODIFICATIONS ---
+
     let Data::Struct(data_struct) = main.data.clone() else {
         panic!("Expected a struct");
     };
@@ -93,16 +103,12 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
         panic!("Expected a struct with named fields");
     };
 
-    // Inline module name
-    // let module_name = Ident::new(&format!("boilermates{}", pascal_to_snake(&main.ident.to_string())), Span::call_site());
-
-    // Parse the attribute arguments
+    // Parse the attribute arguments to declare new structs
     let args = parse_macro_input!(attr as AttributeArgs);
     args.into_iter().for_each(|arg| {
         match arg {
             NestedMeta::Lit(Lit::Str(lit)) => {
                 let struct_name = lit.value().trim_matches('"').to_owned();
-                // new_structs.add(struct_name);
                 structs.insert(
                     struct_name,
                     Struct {
@@ -113,14 +119,9 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             _ => panic!("Expected a string literal"),
         }
-        // eprintln!("Arg: {}", q);
     });
 
-    // let mut reexport = false;
-    // let mut use_in_place = false;
-
-    // Check if attributes are of the following format "#[boilermates(attr_for({x}, {y}))]"
-    // and extract {x} and {y}
+    // Parse #[boilermates(attr_for(...))] to add attributes to specific structs
     main.attrs.retain(|attr| {
         let Ok(meta) = attr.parse_meta() else { return true };
         let syn::Meta::List(list) = meta  else { return true };
@@ -162,16 +163,6 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => panic!("Unknown attrbute `#[boilermates({})]`", ident),
                 }
             }
-
-            // Some(syn::NestedMeta::Meta(syn::Meta::Path(path))) => {
-            //     let Some(ident) = path.get_ident() else { return true };
-            //     match ident.to_string().as_str() {
-            //         "reexport" => reexport = true,
-            //         "use_in_place" => use_in_place = true,
-            //         _ => panic!("Unknown attrbute `#[boilermates({})]`", ident),
-            //     }
-            // }
-
             _ => return true,
         }
         false
@@ -188,6 +179,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             .collect()
     }
 
+    // Add the main struct to the list of structs to be generated
     structs.insert(
         main.ident.to_string(),
         Struct {
@@ -195,9 +187,19 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             fields: vec![],
         },
     );
+    
+    // NEW: Add the captured #[derive(...)] attributes to every struct we plan to generate.
+    // This ensures that both the main struct and all new structs get the derives.
+    for (name, strukt) in structs.iter_mut() {
+        // The main struct already has its attributes, so we only add derives to the new ones.
+        if name != &main.ident.to_string() {
+            strukt.attrs.extend(forwarded_derives.clone());
+        }
+    }
 
     let mut traits = quote! {};
 
+    // Process fields and their attributes
     fields.named.iter_mut().for_each(|field| {
         let mut add_to = structs.keys().cloned().collect::<Vec<_>>();
         let mut default = false;
@@ -230,13 +232,13 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let nested = extract_nested_list(nv);
                         if nested.is_empty() {
                             panic!(
-                                "`#[boilermates(only_in(...))]` must have at least one argument"
+                                "`#[boilermates(not_in(...))]` must have at least one argument"
                             );
                         }
                         nested.iter().for_each(|n| {
                             if !add_to.iter().any(|s| s == n.as_str()) {
                                 panic!(
-                                    "`#[boilermates(only_in(...))]` has undeclared struct name `{}`",
+                                    "`#[boilermates(not_in(...))]` has undeclared struct name `{}`",
                                     n
                                 );
                             }
@@ -306,8 +308,10 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     });
 
+    // Generate the output code
     let mut output = quote! {};
     structs.iter().for_each(|(name, strukt)| {
+        // Build the final struct definition
         let out_struct = DeriveInput {
             attrs: strukt.attrs.clone(),
             data: Data::Struct(DataStruct {
@@ -318,9 +322,9 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .cloned()
                         .map(Into::<Field>::into)
                         .collect(),
-                    ..fields
+                    ..fields.clone()
                 }),
-                ..data_struct
+                ..data_struct.clone()
             }),
             ident: Ident::new(name, Span::call_site()),
             ..main.clone()
@@ -330,6 +334,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             #out_struct
         };
 
+        // Generate From/Into implementations between structs
         structs.iter().for_each(|(other_name, other)| {
 
             if name == other_name { return }
@@ -379,7 +384,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #field_name: self.#field_name,
                     }
                 });
-               
+                
                 let into_args = missing_fields.iter().fold(quote!{}, |acc, field| {
                     let field_name = field.name();
                     let field_ty = &field.field.ty;
@@ -413,12 +418,12 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                     });
 
                 let into_defaults_fn_name = Ident::new(
-                    &pascal_to_snake(&format!("into{}_defaults", name)),
+                    &pascal_to_snake(&format!("into_{}_with_defaults", name)),
                     Span::call_site()
                 );
                 
                 let into_fn_name = Ident::new(
-                    &pascal_to_snake(&format!("into{}", name)),
+                    &pascal_to_snake(&format!("into_{}", name)),
                     Span::call_site()
                 );
 
@@ -453,6 +458,8 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     output.into()
 }
+
+// --- Helper functions (unchanged) ---
 
 fn pascal_to_snake(s: &str) -> String {
     let mut result = String::new();
