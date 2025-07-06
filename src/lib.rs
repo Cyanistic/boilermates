@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet}; // Added HashSet
 
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
@@ -75,6 +75,8 @@ impl Struct {
 #[proc_macro_attribute]
 pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut structs = HashMap::<String, Struct>::new();
+    // NEW: Keep track of structs that have custom attributes defined via `attr_for`.
+    let mut structs_with_custom_attrs = HashSet::new();
 
     let mut main = parse_macro_input!(item as DeriveInput);
 
@@ -137,6 +139,10 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                             Some(NestedMeta::Lit(Lit::Str(strukt))),
                             Some(NestedMeta::Lit(Lit::Str(attr_lit))),
                         ) => {
+                            // NEW: Record that this struct has custom attributes.
+                            let struct_name = strukt.value().trim_matches('"').to_string();
+                            structs_with_custom_attrs.insert(struct_name.clone());
+
                             let attr_tokens: TokenStream2 = attr_lit
                                 .value()
                                 .trim_matches('"')
@@ -145,10 +151,8 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let q = quote! {#attr_tokens};
                             let attr = parse_quote!(#q);
                             structs
-                                .get_mut(strukt.value().trim_matches('"'))
-                                .unwrap_or_else(|| {
-                                    panic!("Struct `{}` not declared", strukt.value())
-                                })
+                                .get_mut(&struct_name)
+                                .unwrap_or_else(|| panic!("Struct `{}` not declared", struct_name))
                                 .attrs
                                 .push(attr);
                         }
@@ -156,7 +160,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "`#[boilermates(attr_for(...))]` must have two string literal arguments"
                         ),
                     },
-                    _ => panic!("Unknown attrbute `#[boilermates({})]`", ident),
+                    _ => panic!("Unknown attribute `#[boilermates({})]`", ident),
                 }
             }
             _ => return true,
@@ -183,8 +187,10 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    // CORRECTED LOGIC IS HERE:
+    // Add the forwarded derive attributes ONLY to the NEW structs that DON'T have custom attributes.
     for (name, strukt) in structs.iter_mut() {
-        if name != &main.ident.to_string() {
+        if name != &main.ident.to_string() && !structs_with_custom_attrs.contains(name) {
             strukt.attrs.extend(forwarded_derives.clone());
         }
     }
@@ -234,7 +240,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                         });
                         add_to.retain(|s| !nested.iter().any(|n| s == n.as_str()));
                     } else {
-                        panic!("Unknown attrbute `#[boilermates({})]`", ident);
+                        panic!("Unknown attribute `#[boilermates({})]`", ident);
                     }
                 }
 
@@ -243,7 +249,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match ident.to_string().as_str() {
                         "default" => default = true,
                         "only_in_self" => add_to = vec![main.ident.to_string()],
-                        _ => panic!("Unknown attrbute `#[boilermates({})]`", ident),
+                        _ => panic!("Unknown attribute `#[boilermates({})]`", ident),
                     }
                 }
                 _ => return true,
