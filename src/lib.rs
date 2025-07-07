@@ -1,13 +1,13 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::{HashMap, HashSet}; // Added HashSet
+use std::collections::{HashMap, HashSet};
 
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
-    parse_macro_input, parse_quote, Attribute, AttributeArgs, Data, DataStruct, DeriveInput, Field,
-    Fields, FieldsNamed, Lit, NestedMeta,
+    parse_macro_input, parse_quote, Attribute, AttributeArgs, Data, DeriveInput, Field,
+    Fields, Lit, NestedMeta,
 };
 
 #[derive(Clone)]
@@ -75,15 +75,17 @@ impl Struct {
 #[proc_macro_attribute]
 pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut structs = HashMap::<String, Struct>::new();
-    // NEW: Keep track of structs that have custom attributes defined via `attr_for`.
     let mut structs_with_custom_attrs = HashSet::new();
 
-    let mut main = parse_macro_input!(item as DeriveInput);
+    let main = parse_macro_input!(item as DeriveInput);
 
-    let forwarded_derives: Vec<Attribute> = main
+    let generics = &main.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let forwarded_attrs: Vec<Attribute> = main
         .attrs
         .iter()
-        .filter(|attr| attr.path.is_ident("derive"))
+        .filter(|attr| !attr.path.is_ident("boilermates"))
         .cloned()
         .collect();
 
@@ -91,12 +93,15 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
         panic!("Expected a struct");
     };
 
-    let Fields::Named(mut fields) = data_struct.fields.clone() else {
+    let Fields::Named(fields) = data_struct.fields.clone() else {
         panic!("Expected a struct with named fields");
     };
 
     let args = parse_macro_input!(attr as AttributeArgs);
+    
+    // Reworked parsing logic for the main attribute
     args.into_iter().for_each(|arg| match arg {
+        // Handles arguments like "CreateUser"
         NestedMeta::Lit(Lit::Str(lit)) => {
             let struct_name = lit.value().trim_matches('"').to_owned();
             structs.insert(
@@ -107,66 +112,54 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
             );
         }
-        _ => panic!("Expected a string literal"),
-    });
+        // Handles arguments like `attr_for(...)`
+        NestedMeta::Meta(syn::Meta::List(list)) => {
+            let Some(ident) = list.path.get_ident() else {
+                panic!("Expected an identifier in the meta list");
+            };
+            match ident.to_string().as_str() {
+                "attr_for" => match (
+                    list.nested.len(),
+                    list.nested.iter().next(),
+                    list.nested.iter().nth(1),
+                ) {
+                    (
+                        2,
+                        Some(NestedMeta::Lit(Lit::Str(strukt))),
+                        Some(NestedMeta::Lit(Lit::Str(attr_lit))),
+                    ) => {
+                        let struct_name = strukt.value().trim_matches('"').to_string();
+                        structs_with_custom_attrs.insert(struct_name.clone());
 
-    main.attrs.retain(|attr| {
-        let Ok(meta) = attr.parse_meta() else {
-            return true;
-        };
-        let syn::Meta::List(list) = meta else {
-            return true;
-        };
-        let Some(name) = list.path.get_ident() else {
-            return true;
-        };
-        if name != "boilermates" {
-            return true;
-        }
-        match list.nested.first() {
-            Some(syn::NestedMeta::Meta(syn::Meta::List(nv))) => {
-                let Some(ident) = nv.path.get_ident() else {
-                    return true;
-                };
-                match ident.to_string().as_str() {
-                    "attr_for" => match (
-                        nv.nested.len(),
-                        nv.nested.iter().next(),
-                        nv.nested.iter().nth(1),
-                    ) {
-                        (
-                            2,
-                            Some(NestedMeta::Lit(Lit::Str(strukt))),
-                            Some(NestedMeta::Lit(Lit::Str(attr_lit))),
-                        ) => {
-                            // NEW: Record that this struct has custom attributes.
-                            let struct_name = strukt.value().trim_matches('"').to_string();
-                            structs_with_custom_attrs.insert(struct_name.clone());
-
-                            let attr_tokens: TokenStream2 = attr_lit
-                                .value()
-                                .trim_matches('"')
-                                .parse()
-                                .unwrap_or_else(|e| panic!("Could not parse attribute: {}", e));
-                            let q = quote! {#attr_tokens};
-                            let attr = parse_quote!(#q);
-                            structs
-                                .get_mut(&struct_name)
-                                .unwrap_or_else(|| panic!("Struct `{}` not declared", struct_name))
-                                .attrs
-                                .push(attr);
+                        let attr_tokens: TokenStream2 = attr_lit
+                            .value()
+                            .trim_matches('"')
+                            .parse()
+                            .unwrap_or_else(|e| panic!("Could not parse attribute: {}", e));
+                        let q = quote! {#attr_tokens};
+                        let attr = parse_quote!(#q);
+                        
+                        // Ensure the struct exists before trying to add attributes
+                        if !structs.contains_key(&struct_name) {
+                             structs.insert(struct_name.clone(), Struct { attrs: vec![], fields: vec![] });
                         }
-                        _ => panic!(
-                            "`#[boilermates(attr_for(...))]` must have two string literal arguments"
-                        ),
-                    },
-                    _ => panic!("Unknown attribute `#[boilermates({})]`", ident),
-                }
+                        
+                        structs
+                            .get_mut(&struct_name)
+                            .unwrap() // Should not panic due to the check above
+                            .attrs
+                            .push(attr);
+                    }
+                    _ => panic!(
+                        "`#[boilermates(attr_for(...))]` must have two string literal arguments"
+                    ),
+                },
+                _ => panic!("Unknown attribute `#[boilermates({})]`", ident),
             }
-            _ => return true,
         }
-        false
+        _ => panic!("Expected a string literal or a meta list in the boilermates attribute"),
     });
+
 
     fn extract_nested_list(meta_list: &syn::MetaList) -> Vec<String> {
         meta_list
@@ -182,23 +175,24 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
     structs.insert(
         main.ident.to_string(),
         Struct {
-            attrs: main.attrs.clone(),
+            // We strip boilermates attributes from the main struct before generating it
+            attrs: main.attrs.iter().filter(|a| !a.path.is_ident("boilermates")).cloned().collect(),
             fields: vec![],
         },
     );
 
-    // CORRECTED LOGIC IS HERE:
-    // Add the forwarded derive attributes ONLY to the NEW structs that DON'T have custom attributes.
     for (name, strukt) in structs.iter_mut() {
         if name != &main.ident.to_string() && !structs_with_custom_attrs.contains(name) {
-            strukt.attrs.extend(forwarded_derives.clone());
+            strukt.attrs.extend(forwarded_attrs.clone());
         }
     }
 
-    fields.named.iter_mut().for_each(|field| {
+    fields.named.iter().for_each(|field| {
         let mut add_to = structs.keys().cloned().collect::<Vec<_>>();
         let mut default = false;
-        field.attrs.retain(|attr| {
+        
+        let mut clean_field = field.clone();
+        clean_field.attrs.retain(|attr| {
             let Ok(meta) = attr.parse_meta() else { return true };
             let syn::Meta::List(list) = meta  else { return true };
             let Some(name) = list.path.get_ident() else { return true };
@@ -215,14 +209,14 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                             );
                         }
                         nested.iter().for_each(|n| {
-                            if !add_to.iter().any(|s| s == n.as_str()) {
+                            if !structs.contains_key(n) {
                                 panic!(
                                     "`#[boilermates(only_in(...))]` has undeclared struct name `{}`",
                                     n
                                 );
                             }
                         });
-                        add_to.retain(|s| nested.iter().any(|n| s == n.as_str()));
+                        add_to.retain(|s| nested.iter().any(|n| s == n.as_str()) || s == &main.ident.to_string());
                     } else if ident == "not_in" {
                         let nested = extract_nested_list(nv);
                         if nested.is_empty() {
@@ -231,7 +225,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                             );
                         }
                         nested.iter().for_each(|n| {
-                            if !add_to.iter().any(|s| s == n.as_str()) {
+                            if !structs.contains_key(n) {
                                 panic!(
                                     "`#[boilermates(not_in(...))]` has undeclared struct name `{}`",
                                     n
@@ -257,80 +251,69 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             false
         });
 
-        let field = FieldConfig::new(field.clone(), default);
+        let field_config = FieldConfig::new(clean_field, default);
 
-        structs.iter_mut().for_each(|(struct_name, strukt)| {
+        for (struct_name, strukt) in structs.iter_mut() {
             if add_to.contains(struct_name) {
-                strukt.fields.push(field.clone());
+                strukt.fields.push(field_config.clone());
             }
-        });
+        }
     });
 
-    let mut output = quote! {};
-    structs.iter().for_each(|(name, strukt)| {
-        let out_struct = DeriveInput {
-            attrs: strukt.attrs.clone(),
-            data: Data::Struct(DataStruct {
-                fields: Fields::Named(FieldsNamed {
-                    named: strukt
-                        .fields
-                        .iter()
-                        .cloned()
-                        .map(Into::<Field>::into)
-                        .collect(),
-                    ..fields.clone()
-                }),
-                ..data_struct.clone()
-            }),
-            ident: Ident::new(name, Span::call_site()),
-            ..main.clone()
-        };
-        output = quote! {
-            #output
-            #out_struct
-        };
+    let mut struct_defs = quote! {};
+    let mut impl_blocks = quote! {};
 
-        structs.iter().for_each(|(other_name, other)| {
-            if name == other_name {
-                return;
+    for (name, strukt) in structs.iter() {
+        let struct_ident = Ident::new(name, Span::call_site());
+        let struct_attrs = &strukt.attrs;
+        let struct_fields = strukt.fields.iter().map(|f_conf| &f_conf.field);
+        let vis = &main.vis;
+
+        struct_defs = quote! {
+            #struct_defs
+            #(#struct_attrs)*
+            #vis struct #struct_ident #generics #where_clause {
+                #(#struct_fields),*
             }
+        };
+    }
+
+    for (name, strukt) in structs.iter() {
+        for (other_name, other) in structs.iter() {
+            if name == other_name {
+                continue;
+            }
+
             let name_ident = Ident::new(name, Span::call_site());
             let other_name_ident = Ident::new(other_name, Span::call_site());
+            
             let missing_fields = strukt.missing_fields_from(other);
-            let missing_fields_without_defaults = missing_fields
+            let missing_fields_without_defaults: Vec<&FieldConfig> = missing_fields
                 .iter()
                 .filter(|f| !f.default)
-                .collect::<Vec<_>>();
-
-            let default_field_setters =
-                missing_fields
-                    .iter()
-                    .filter(|f| f.default)
-                    .fold(quote! {}, |acc, field| {
-                        let field_name = field.name();
-                        quote! {
-                            #acc
-                            #field_name: Default::default(),
-                        }
-                    });
+                .collect();
+            
+            let default_field_setters = missing_fields.iter().filter(|f| f.default).fold(quote!{}, |acc, field| {
+                let field_name = field.name();
+                quote! {
+                    #acc
+                    #field_name: Default::default(),
+                }
+            });
 
             if missing_fields_without_defaults.is_empty() {
-                let common_field_setters =
-                    strukt
-                        .same_fields_as(other)
-                        .iter()
-                        .fold(quote! {}, |acc, field| {
-                            let field_name = &field.name();
-                            quote! {
-                                #acc
-                                #field_name: other.#field_name,
-                            }
-                        });
+                let common_field_setters = strukt.same_fields_as(other).iter().fold(quote!{}, |acc, field| {
+                    let field_name = &field.name();
+                    quote! {
+                        #acc
+                        #field_name: other.#field_name,
+                    }
+                });
 
-                output = quote! {
-                    #output
-                    impl From<#other_name_ident> for #name_ident {
-                        fn from(other: #other_name_ident) -> Self {
+                impl_blocks = quote! {
+                    #impl_blocks
+                    impl #impl_generics From<#other_name_ident #ty_generics> for #name_ident #ty_generics #where_clause {
+                        fn from(other: #other_name_ident #ty_generics) -> Self {
                             Self {
                                 #common_field_setters
                                 #default_field_setters
@@ -340,19 +323,15 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
             }
             if !missing_fields.is_empty() {
-                let common_field_setters =
-                    strukt
-                        .same_fields_as(other)
-                        .iter()
-                        .fold(quote! {}, |acc, field| {
-                            let field_name = field.name();
-                            quote! {
-                                #acc
-                                #field_name: self.#field_name,
-                            }
-                        });
-
-                let into_args = missing_fields.iter().fold(quote! {}, |acc, field| {
+                let common_field_setters = strukt.same_fields_as(other).iter().fold(quote!{}, |acc, field| {
+                    let field_name = field.name();
+                    quote! {
+                        #acc
+                        #field_name: self.#field_name,
+                    }
+                });
+                
+                let into_args = missing_fields.iter().fold(quote!{}, |acc, field| {
                     let field_name = field.name();
                     let field_ty = &field.field.ty;
                     quote! {
@@ -361,52 +340,50 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 });
 
-                let into_defaults_args =
-                    missing_fields_without_defaults
-                        .iter()
-                        .fold(quote! {}, |acc, field| {
-                            let field_name = field.name();
-                            let field_ty = &field.field.ty;
-                            quote! {
-                                #acc
-                                #field_name: #field_ty,
-                            }
-                        });
-
-                let into_missing_setters = missing_fields.iter().fold(quote! {}, |acc, field| {
+                let into_defaults_args = missing_fields_without_defaults.iter().fold(quote!{}, |acc, field| {
                     let field_name = field.name();
-                    quote! { #acc #field_name, }
+                    let field_ty = &field.field.ty;
+                    quote! {
+                        #acc
+                        #field_name: #field_ty,
+                    }
                 });
 
-                let into_defaults_missing_setters =
-                    missing_fields_without_defaults
-                        .iter()
-                        .fold(quote! {}, |acc, field| {
-                            let field_name = field.name();
-                            quote! { #acc #field_name, }
-                        });
+                let into_missing_setters = missing_fields
+                    .iter()
+                    .fold(quote! {}, |acc, field| {
+                        let field_name = field.name();
+                        quote! { #acc #field_name, }
+                    });
+
+                let into_defaults_missing_setters = missing_fields_without_defaults
+                    .iter()
+                    .fold(quote! {}, |acc, field| {
+                        let field_name = field.name();
+                        quote! { #acc #field_name, }
+                    });
 
                 let into_defaults_fn_name = Ident::new(
                     &pascal_to_snake(&format!("into_{}_with_defaults", name)),
-                    Span::call_site(),
+                    Span::call_site()
                 );
-
+                
                 let into_fn_name = Ident::new(
                     &pascal_to_snake(&format!("into_{}", name)),
-                    Span::call_site(),
+                    Span::call_site()
                 );
 
-                output = quote! {
-                    #output
-                    impl #other_name_ident {
-                        pub fn #into_fn_name(self, #into_args) -> #name_ident {
+                impl_blocks = quote! {
+                    #impl_blocks
+                    impl #impl_generics #other_name_ident #ty_generics #where_clause {
+                        pub fn #into_fn_name(self, #into_args) -> #name_ident #ty_generics {
                             #name_ident {
                                 #common_field_setters
                                 #into_missing_setters
                             }
                         }
 
-                        pub fn #into_defaults_fn_name(self, #into_defaults_args) -> #name_ident {
+                        pub fn #into_defaults_fn_name(self, #into_defaults_args) -> #name_ident #ty_generics {
                             #name_ident {
                                 #common_field_setters
                                 #default_field_setters
@@ -416,10 +393,13 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
             }
-        })
-    });
+        }
+    }
 
-    output.into()
+    quote! {
+        #struct_defs
+        #impl_blocks
+    }.into()
 }
 
 fn pascal_to_snake(s: &str) -> String {
