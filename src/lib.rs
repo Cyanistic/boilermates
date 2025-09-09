@@ -27,6 +27,13 @@ impl FieldConfig {
             .clone()
             .unwrap_or_else(|| panic!("Can't get field name. This should never happen."))
     }
+    
+    fn has_same_type(&self, other: &Self) -> bool {
+        // Compare the type tokens to check if types are the same
+        let self_type = &self.field.ty;
+        let other_type = &other.field.ty;
+        quote!(#self_type).to_string() == quote!(#other_type).to_string()
+    }
 }
 
 impl PartialEq for FieldConfig {
@@ -68,6 +75,15 @@ impl Struct {
                 acc.push(field.clone())
             }
             acc
+        })
+    }
+    
+    fn has_compatible_fields_with(&self, other: &Self) -> bool {
+        // Check if all common fields have the same type
+        self.fields.iter().all(|field| {
+            other.fields.iter()
+                .find(|f| f.name() == field.name())
+                .map_or(true, |other_field| field.has_same_type(other_field))
         })
     }
 }
@@ -216,7 +232,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 );
                             }
                         });
-                        add_to.retain(|s| nested.iter().any(|n| s == n.as_str()) || s == &main.ident.to_string());
+                        add_to.retain(|s| nested.iter().any(|n| s == n.as_str()));
                     } else if ident == "not_in" {
                         let nested = extract_nested_list(nv);
                         if nested.is_empty() {
@@ -255,7 +271,11 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         for (struct_name, strukt) in structs.iter_mut() {
             if add_to.contains(struct_name) {
-                strukt.fields.push(field_config.clone());
+                // Check if a field with the same name already exists
+                let field_exists = strukt.fields.iter().any(|f| f.name() == field_config.name());
+                if !field_exists {
+                    strukt.fields.push(field_config.clone());
+                }
             }
         }
     });
@@ -301,7 +321,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             });
 
-            if missing_fields_without_defaults.is_empty() {
+            if missing_fields_without_defaults.is_empty() && strukt.has_compatible_fields_with(other) {
                 let common_field_setters = strukt.same_fields_as(other).iter().fold(quote!{}, |acc, field| {
                     let field_name = &field.name();
                     quote! {
@@ -322,7 +342,7 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
             }
-            if !missing_fields.is_empty() {
+            if !missing_fields.is_empty() && strukt.has_compatible_fields_with(other) {
                 let common_field_setters = strukt.same_fields_as(other).iter().fold(quote!{}, |acc, field| {
                     let field_name = field.name();
                     quote! {
