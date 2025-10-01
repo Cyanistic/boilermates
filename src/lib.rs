@@ -14,11 +14,24 @@ use syn::{
 struct FieldConfig {
     field: Field,
     default: bool,
+    init_expr: Option<String>,
 }
 
 impl FieldConfig {
     fn new(field: Field, default: bool) -> Self {
-        Self { field, default }
+        Self {
+            field,
+            default,
+            init_expr: None,
+        }
+    }
+
+    fn with_init(field: Field, init_expr: String) -> Self {
+        Self {
+            field,
+            default: false,
+            init_expr: Some(init_expr),
+        }
     }
 
     fn name(&self) -> Ident {
@@ -206,13 +219,34 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
     fields.named.iter().for_each(|field| {
         let mut add_to = structs.keys().cloned().collect::<Vec<_>>();
         let mut default = false;
-        
+        let mut init_expr: Option<String> = None;
+
         let mut clean_field = field.clone();
         clean_field.attrs.retain(|attr| {
             let Ok(meta) = attr.parse_meta() else { return true };
             let syn::Meta::List(list) = meta  else { return true };
             let Some(name) = list.path.get_ident() else { return true };
             if name != "boilermates" { return true }
+
+            // Process all nested attributes
+            for nested in &list.nested {
+                match nested {
+                    syn::NestedMeta::Meta(syn::Meta::NameValue(nv)) => {
+                        let Some(ident) = nv.path.get_ident() else { continue };
+                        if ident == "init" {
+                            if let syn::Lit::Str(lit_str) = &nv.lit {
+                                init_expr = Some(lit_str.value());
+                            } else {
+                                panic!("`init` attribute must be a string literal");
+                            }
+                        } else {
+                            panic!("Unknown attribute `#[boilermates({} = ...)]`", ident);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             match list.nested.first() {
                 Some(syn::NestedMeta::Meta(syn::Meta::List(nv))) => {
                     let Some(ident) = nv.path.get_ident() else { panic!("#[boilermates] parsing error") };
@@ -267,7 +301,11 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             false
         });
 
-        let field_config = FieldConfig::new(clean_field, default);
+        let field_config = if let Some(expr) = init_expr {
+            FieldConfig::with_init(clean_field, expr)
+        } else {
+            FieldConfig::new(clean_field, default)
+        };
 
         for (struct_name, strukt) in structs.iter_mut() {
             if add_to.contains(struct_name) {
@@ -310,14 +348,30 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             let missing_fields = strukt.missing_fields_from(other);
             let missing_fields_without_defaults: Vec<&FieldConfig> = missing_fields
                 .iter()
-                .filter(|f| !f.default)
+                .filter(|f| !f.default && f.init_expr.is_none())
                 .collect();
-            
-            let default_field_setters = missing_fields.iter().filter(|f| f.default).fold(quote!{}, |acc, field| {
+
+            let default_field_setters = missing_fields.iter().filter_map(|field| {
                 let field_name = field.name();
+                if let Some(init_expr) = &field.init_expr {
+                    // Use custom init expression
+                    let init_tokens: TokenStream2 = init_expr.parse()
+                        .unwrap_or_else(|e| panic!("Failed to parse init expression '{}': {}", init_expr, e));
+                    Some(quote! {
+                        #field_name: #init_tokens,
+                    })
+                } else if field.default {
+                    // Use Default::default()
+                    Some(quote! {
+                        #field_name: Default::default(),
+                    })
+                } else {
+                    None
+                }
+            }).fold(quote!{}, |acc, tokens| {
                 quote! {
                     #acc
-                    #field_name: Default::default(),
+                    #tokens
                 }
             });
 
