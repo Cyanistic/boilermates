@@ -101,6 +101,19 @@ impl Struct {
     }
 }
 
+/// Substitutes $struct variable in attribute tokens with the actual struct name
+fn substitute_struct_variable(attr: &Attribute, struct_name: &str) -> Attribute {
+    let tokens = attr.tokens.to_string();
+    let substituted = tokens.replace("$struct", struct_name);
+    let new_tokens: TokenStream2 = substituted
+        .parse()
+        .unwrap_or_else(|e| panic!("Failed to parse substituted attribute tokens: {}", e));
+
+    let mut new_attr = attr.clone();
+    new_attr.tokens = new_tokens;
+    new_attr
+}
+
 #[proc_macro_attribute]
 pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut structs = HashMap::<String, Struct>::new();
@@ -201,18 +214,30 @@ pub fn boilermates(attr: TokenStream, item: TokenStream) -> TokenStream {
             .collect()
     }
 
+    // Apply $struct substitution to main struct attributes as well
+    let main_struct_name = main.ident.to_string();
+    let main_attrs_substituted: Vec<Attribute> = main.attrs
+        .iter()
+        .filter(|a| !a.path.is_ident("boilermates"))
+        .map(|attr| substitute_struct_variable(attr, &main_struct_name))
+        .collect();
+
     structs.insert(
-        main.ident.to_string(),
+        main_struct_name.clone(),
         Struct {
-            // We strip boilermates attributes from the main struct before generating it
-            attrs: main.attrs.iter().filter(|a| !a.path.is_ident("boilermates")).cloned().collect(),
+            attrs: main_attrs_substituted,
             fields: vec![],
         },
     );
 
     for (name, strukt) in structs.iter_mut() {
         if name != &main.ident.to_string() && !structs_with_custom_attrs.contains(name) {
-            strukt.attrs.extend(forwarded_attrs.clone());
+            // Clone and apply struct name substitution to forwarded attributes
+            let substituted_attrs: Vec<Attribute> = forwarded_attrs
+                .iter()
+                .map(|attr| substitute_struct_variable(attr, name))
+                .collect();
+            strukt.attrs.extend(substituted_attrs);
         }
     }
 
